@@ -21,12 +21,15 @@ let
   beamMain = pkgs.beam28Packages.overrideScope (_: _: { erlang = erlangMain; });
 
   elixirMain = beamMain.elixir_1_20.overrideAttrs (_: {
-    version = "1.21.0-main-669f848";
+    version = "1.21.0-main-669f848-recompile";
     src = pkgs.fetchFromGitHub {
-      owner = "elixir-lang";
+      # elixir-lang/elixir main 669f848 + reuse type check results of
+      # dependents when signatures are unchanged:
+      # github.com/onnimonni/elixir/tree/faster-recompile
+      owner = "onnimonni";
       repo = "elixir";
-      rev = "669f8481992a14820cd155d291aded6d41994b54";
-      hash = "sha256-Sc1iI6Ga72gqm3LAB/hUaJXHGefSg+2ASr4e3u3XmR4=";
+      rev = "d385a20aeb1074375289ed9724a1b939bd0cf380";
+      hash = "sha256-JgqZLNj0zp+ub4eqwrJcJ7UVpF2ttgrVnlNiK4qfZfU=";
     };
   });
 in

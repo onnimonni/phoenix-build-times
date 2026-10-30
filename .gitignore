@@ -2,3 +2,6 @@
 devenv.local.nix
 .direnv
 .pre-commit-config.yaml
+
+# Playwright MCP snapshots and logs
+.playwright-mcp/

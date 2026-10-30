@@ -70,8 +70,8 @@ defmodule Shop.MixProject do
   defp deps do
     [
       {:bcrypt_elixir, "~> 3.0"},
-      # phoenix main + shared route prepare (onnimonni/phoenix router-shared-prepare)
-      {:phoenix, github: "onnimonni/phoenix", branch: "router-shared-prepare", override: true},
+      # phoenix main + faster router compile (onnimonni/phoenix router-faster-compile)
+      {:phoenix, github: "onnimonni/phoenix", branch: "router-faster-compile", override: true},
       {:phoenix_ecto, "~> 4.5"},
       {:ecto_sql, "~> 3.13"},
       {:ecto_sqlite3, ">= 0.0.0"},

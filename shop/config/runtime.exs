@@ -23,20 +23,47 @@ end
 config :shop, ShopWeb.Endpoint, http: [port: String.to_integer(System.get_env("PORT", "4000"))]
 
 if config_env() == :dev do
-  # Reload browser tabs when matching files change.
-  config :shop, ShopWeb.Endpoint,
-    live_reload: [
-      web_console_logger: true,
-      patterns: [
-        # Static assets, except user uploads
-        ~r"priv/static/(?!uploads/).*\.(js|css|png|jpeg|jpg|gif|svg)$"E,
-        # Gettext translations
-        ~r"priv/gettext/.*\.po$"E,
-        # Router, Controllers, LiveViews and LiveComponents
-        ~r"lib/shop_web/router\.ex$"E,
-        ~r"lib/shop_web/(controllers|live|components)/.*\.(ex|heex)$"E
+  # LIVE_RELOAD_DEFAULTS=1 restores the generated config (for benchmarks)
+  if System.get_env("LIVE_RELOAD_DEFAULTS") == "1" do
+    # Reload browser tabs when matching files change.
+    config :shop, ShopWeb.Endpoint,
+      live_reload: [
+        web_console_logger: true,
+        patterns: [
+          # Static assets, except user uploads
+          ~r"priv/static/(?!uploads/).*\.(js|css|png|jpeg|jpg|gif|svg)$"E,
+          # Gettext translations
+          ~r"priv/gettext/.*\.po$"E,
+          # Router, Controllers, LiveViews and LiveComponents
+          ~r"lib/shop_web/router\.ex$"E,
+          ~r"lib/shop_web/(controllers|live|components)/.*\.(ex|heex)$"E
+        ]
       ]
-    ]
+  else
+    # Connected LiveViews recompile and re-render in place, keeping their
+    # state, instead of reloading the whole page (LIVE_RELOAD_NO_NOTIFY=1 for
+    # benchmarks)
+    live_view_files = ~r"lib/shop_web/(live|components)/.*\.(ex|heex)$"E
+    notify? = System.get_env("LIVE_RELOAD_NO_NOTIFY") != "1"
+
+    config :shop, ShopWeb.Endpoint,
+      live_reload: [
+        web_console_logger: true,
+        # Reload right away instead of after 100ms
+        interval: 0,
+        patterns:
+          [
+            ~r"priv/static/(?!uploads/).*\.(js|css|png|jpeg|jpg|gif|svg)$"E,
+            ~r"priv/gettext/.*\.po$"E,
+            ~r"lib/shop_web/router\.ex$"E,
+            ~r"lib/shop_web/controllers/.*\.(ex|heex)$"E
+          ] ++ if(notify?, do: [], else: [live_view_files]),
+        notify: if(notify?, do: [live_view: [live_view_files]], else: [])
+      ]
+
+    # macOS reports file changes after ~200ms by default
+    config :phoenix_live_reload, :backend_opts, latency: 0.0, no_defer: true
+  end
 end
 
 if config_env() == :prod do
