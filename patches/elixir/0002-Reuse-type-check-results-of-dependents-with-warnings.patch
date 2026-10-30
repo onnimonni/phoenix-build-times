@@ -1,0 +1,541 @@
+From e361f58d9d974e1fb5ebfc0920b6d272240af00f Mon Sep 17 00:00:00 2001
+From: Onni Hakala <onni@flaky.build>
+Date: Fri, 30 Oct 2026 21:44:14 +0200
+Subject: [PATCH 2/4] Reuse type check results of dependents with warnings
+
+The type check result of each module is stored in the manifest as its grouped
+type diagnostics. When a runtime dependent is verified again because a module
+it calls was recompiled with the same ExCk chunk, its previous result is
+reported again instead of type checking it, so its warnings are printed
+exactly as before. Behaviour checks and @after_verify callbacks still run.
+
+Phoenix app with a type warning in the router: editing a LiveView no longer
+type checks the router, mix compile 0.45s -> 0.39s.
+---
+ lib/elixir/lib/kernel/parallel_compiler.ex    |  19 +++-
+ lib/elixir/lib/module/parallel_checker.ex     |  92 ++++++++++------
+ lib/mix/lib/mix/compilers/elixir.ex           |  59 +++++++---
+ .../test/mix/tasks/compile.elixir_test.exs    | 104 +++++++++++++++++-
+ 4 files changed, 221 insertions(+), 53 deletions(-)
+
+diff --git a/lib/elixir/lib/kernel/parallel_compiler.ex b/lib/elixir/lib/kernel/parallel_compiler.ex
+index 3de7ba24a..6c6ab70bb 100644
+--- a/lib/elixir/lib/kernel/parallel_compiler.ex
++++ b/lib/elixir/lib/kernel/parallel_compiler.ex
+@@ -26,7 +26,7 @@ defmodule Kernel.ParallelCompiler do
+           each_long_verification: (module() -> term()) | (module(), pid() -> term()),
+           each_module: (Path.t(), module(), binary() -> term()),
+           each_cycle: (-> {:compile, [Path.t()], [Code.diagnostic(:warning)]}
+-                          | {:runtime, [{module(), Path.t()} | {module(), Path.t(), boolean()}],
++                          | {:runtime, [{module(), Path.t()} | {module(), Path.t(), boolean() | {:cached, term()}}],
+                              [Code.diagnostic(:warning)]}),
+           long_compilation_threshold: pos_integer(),
+           long_verification_threshold: pos_integer(),
+@@ -35,6 +35,7 @@ defmodule Kernel.ParallelCompiler do
+           dest: Path.t(),
+           beam_timestamp: term(),
+           return_diagnostics: boolean(),
++          return_type_checks: boolean(),
+           max_concurrency: pos_integer(),
+           purge_compiler_modules: boolean()
+         ]
+@@ -186,7 +187,9 @@ def pmap(collection, fun) when is_function(fun, 1) do
+         further module files to compile
+       * `{:runtime, modules, warnings}` - to stop compilation and verify the list
+         of `{module, path}` pairs because dependent modules have changed. A
+-        `{module, path, false}` triplet skips type checking that module
++        `{module, path, false}` triplet skips type checking that module and
++        `{module, path, {:cached, result}}` reports a result previously returned
++        under `:type_checks` (see `:return_type_checks`) instead of type checking it
+ 
+     * `:long_compilation_threshold` - the timeout (in seconds) to check for files
+       taking too long to compile. For each file that exceeds the threshold, the
+@@ -218,6 +221,10 @@ def pmap(collection, fun) when is_function(fun, 1) do
+       a list of warnings and returns diagnostics as maps instead of tuples.
+       This option must be set to true, except for backward compatibility reasons.
+ 
++    * `:return_type_checks` - also returns the type check result of each type
++      checked module, as a map of modules under the `:type_checks` key of the
++      returned information. It requires `:return_diagnostics`
++
+     * `:max_concurrency` - the maximum number of files to compile in parallel.
+       Setting this option to 1 will compile files sequentially.
+       Defaults to the number of schedulers online, or at least `2`.
+@@ -368,6 +375,7 @@ defp spawn_workers(schedulers, checker, files, output, options) do
+         schedulers: schedulers,
+         checker: checker,
+         verification?: Keyword.get(options, :verification, true),
++        type_checks?: Keyword.get(options, :return_type_checks, false),
+         purge_compiler_modules: purge_compiler_modules
+       })
+ 
+@@ -460,7 +468,7 @@ defp verify_modules(result, compile_warnings, dependent_modules, state) do
+     modules = write_module_binaries(result, state.output, state)
+     profile(state, "after compile callback", state.after_compile)
+ 
+-    {runtime_warnings, errors} =
++    {runtime_warnings, errors, type_checks} =
+       if state.verification? do
+         profile(
+           state,
+@@ -468,13 +476,14 @@ defp verify_modules(result, compile_warnings, dependent_modules, state) do
+             num_modules = length(modules) + length(dependent_modules)
+             "group pass check of #{num_modules} modules"
+           end,
+-          fn -> Module.ParallelChecker.verify(state.checker, dependent_modules) end
++          fn -> Module.ParallelChecker.verify_with_types(state.checker, dependent_modules) end
+         )
+       else
+-        {[], []}
++        {[], [], %{}}
+       end
+ 
+     info = %{compile_warnings: Enum.reverse(compile_warnings), runtime_warnings: runtime_warnings}
++    info = if state.type_checks?, do: Map.put(info, :type_checks, type_checks), else: info
+ 
+     case errors do
+       [] ->
+diff --git a/lib/elixir/lib/module/parallel_checker.ex b/lib/elixir/lib/module/parallel_checker.ex
+index c34c11efb..652c0c345 100644
+--- a/lib/elixir/lib/module/parallel_checker.ex
++++ b/lib/elixir/lib/module/parallel_checker.ex
+@@ -87,7 +87,7 @@ def spawn({pid, {checker, table}}, module, module_map, signatures, beam_location
+     end
+   end
+ 
+-  defp spawn_checker(ref, pid, checker, table, module, module_tuple, log?, types?) do
++  defp spawn_checker(ref, pid, checker, table, module, module_tuple, log?, check_types) do
+     spawn(fn ->
+       mon_ref = Process.monitor(pid)
+ 
+@@ -96,8 +96,10 @@ defp spawn_checker(ref, pid, checker, table, module, module_tuple, log?, types?)
+           # Set the compiler info so we can collect warnings
+           Process.link(pid)
+           :erlang.put(:elixir_compiler_info, {pid, self()})
+-          {warnings, errors} = check_module(module_tuple, {checker, table}, log?, types?, profile)
+-          send(pid, {__MODULE__, module, warnings, errors})
++          {warnings, errors, types} =
++            check_module(module_tuple, {checker, table}, log?, check_types, profile)
++
++          send(pid, {__MODULE__, module, warnings, errors, types})
+           send(checker, {__MODULE__, :checked, ref})
+ 
+         {:DOWN, ^mon_ref, _, _, _} ->
+@@ -106,7 +108,7 @@ defp spawn_checker(ref, pid, checker, table, module, module_tuple, log?, types?)
+     end)
+   end
+ 
+-  defp spawn_and_register_cache(pid, checker, table, module, info, log?, types?) do
++  defp spawn_and_register_cache(pid, checker, table, module, info, log?, check_types) do
+     ref = make_ref()
+ 
+     spawned =
+@@ -132,7 +134,7 @@ defp spawn_and_register_cache(pid, checker, table, module, info, log?, types?) d
+               module_tuple = module_map_to_module_tuple(module_map)
+ 
+               spawned =
+-                spawn_checker(ref, pid, checker, table, module, module_tuple, log?, types?)
++                spawn_checker(ref, pid, checker, table, module, module_tuple, log?, check_types)
+ 
+               :ets.insert(table, {module, mode})
+               send(checker, {__MODULE__, :cached, module, spawned, ref})
+@@ -141,7 +143,7 @@ defp spawn_and_register_cache(pid, checker, table, module, info, log?, types?) d
+                 # Nothing to check, so we notify everyone we are done
+                 :ets.insert(table, {module, :uncached})
+                 send(checker, {__MODULE__, :cached, module, nil, ref})
+-                send(pid, {__MODULE__, module, [], []})
++                send(pid, {__MODULE__, module, [], [], nil})
+             end
+ 
+           {:DOWN, ^mon_ref, _, _, _} ->
+@@ -198,49 +200,65 @@ def verify(fun) do
+   Returns the updated list of warnings from the verification.
+   """
+   @spec verify(cache(), [{module(), Path.t()}]) :: {[warning()], [error()]}
+-  def verify({checker, table}, runtime_files) do
++  def verify(cache, runtime_files) do
++    {warnings, errors, _types} = verify_with_types(cache, runtime_files)
++    {warnings, errors}
++  end
++
++  @doc """
++  Same as `verify/2` but also returns the type check result of each module
++  that was type checked.
++
++  Runtime files may be given as `{module, path, types}` triplets, where `types`
++  is `true` to type check the module, `false` to skip type checking, or
++  `{:cached, result}` with a result previously returned by this function, which
++  is reported instead of type checking the module again. Behaviours and
++  `@after_verify` callbacks always run.
++  """
++  def verify_with_types({checker, table}, runtime_files) do
+     value = :erlang.get(:elixir_code_diagnostics)
+     log? = not match?({_, false}, value)
+ 
+     for runtime_file <- runtime_files do
+-      {module, file, types?} =
++      {module, file, check_types} =
+         case runtime_file do
+           {module, file} -> {module, file, true}
+-          {module, file, types?} -> {module, file, types?}
++          {module, file, check_types} -> {module, file, check_types}
+         end
+ 
+-      spawn_and_register_cache(self(), checker, table, module, file, log?, types?)
++      spawn_and_register_cache(self(), checker, table, module, file, log?, check_types)
+     end
+ 
+     count = :gen_server.call(checker, :start, :infinity)
+-    {warnings, errors} = collect_results(count, [], [])
++    {warnings, errors, types} = collect_results(count, [], [], %{})
+ 
+     case :erlang.get(:elixir_code_diagnostics) do
+       :undefined -> :ok
+       {tail, log?} -> :erlang.put(:elixir_code_diagnostics, {errors ++ warnings ++ tail, log?})
+     end
+ 
+-    {warnings, errors}
++    {warnings, errors, types}
+   end
+ 
+-  defp collect_results(0, warnings, errors) do
+-    {warnings, errors}
++  defp collect_results(0, warnings, errors, types) do
++    {warnings, errors, types}
+   end
+ 
+-  defp collect_results(count, warnings, errors) do
++  defp collect_results(count, warnings, errors, types) do
+     receive do
+       {:diagnostic, %{file: file} = diagnostic, read_snippet} ->
+         :elixir_errors.print_diagnostic(diagnostic, read_snippet)
+         diagnostic = %{diagnostic | file: file && Path.absname(file)}
+ 
+         if Map.get(diagnostic, :severity, :warning) == :error do
+-          collect_results(count, warnings, [diagnostic | errors])
++          collect_results(count, warnings, [diagnostic | errors], types)
+         else
+-          collect_results(count, [diagnostic | warnings], errors)
++          collect_results(count, [diagnostic | warnings], errors, types)
+         end
+ 
+-      {__MODULE__, _module, new_warnings, new_errors} ->
+-        collect_results(count - 1, new_warnings ++ warnings, new_errors ++ errors)
++      {__MODULE__, module, new_warnings, new_errors, module_types} ->
++        types = if module_types, do: Map.put(types, module, module_types), else: types
++        collect_results(count - 1, new_warnings ++ warnings, new_errors ++ errors, types)
+     end
+   end
+ 
+@@ -280,7 +298,7 @@ def fetch_export({checker, table}, module, fun, arity, force?) do
+ 
+   ## Module checking
+ 
+-  defp check_module(module_tuple, cache, log?, types?, profile) do
++  defp check_module(module_tuple, cache, log?, check_types, profile) do
+     {module, file, line, definitions, no_warn_undefined, behaviours, impls, attrs, after_verify} =
+       module_tuple
+ 
+@@ -294,20 +312,32 @@ defp check_module(module_tuple, cache, log?, types?, profile) do
+         definitions
+       )
+ 
+-    # Callers reuse the previous type check result when its inputs are unchanged
+-    type_warnings =
+-      if types? do
+-        profile(module, profile, fn ->
+-          Module.Types.warnings(module, file, attrs, definitions, no_warn_undefined, cache)
+-        end)
+-      else
+-        []
++    # Callers may give the result of a previous type check when its inputs are
++    # unchanged. Type and behaviour diagnostics can be grouped separately, as
++    # behaviour diagnostics are never grouped.
++    {types, new_types} =
++      case check_types do
++        true ->
++          types =
++            profile(module, profile, fn ->
++              Module.Types.warnings(module, file, attrs, definitions, no_warn_undefined, cache)
++            end)
++            |> group_diagnostics()
++
++          {types, types}
++
++        {:cached, types} ->
++          {types, nil}
++
++        false ->
++          {[], nil}
+       end
+ 
+     {warnings, errors} =
+-      type_warnings
+-      |> Kernel.++(behaviour_warnings)
++      behaviour_warnings
+       |> group_diagnostics()
++      |> Kernel.++(types)
++      |> Enum.sort()
+       |> emit_diagnostics(file, log?)
+       |> Enum.split_with(&(&1.severity == :warning))
+ 
+@@ -315,7 +345,7 @@ defp check_module(module_tuple, cache, log?, types?, profile) do
+       apply(verify_mod, verify_fun, [module])
+     end)
+ 
+-    {warnings, errors}
++    {warnings, errors, new_types}
+   end
+ 
+   defp module_map_to_module_tuple(module_map) do
+diff --git a/lib/mix/lib/mix/compilers/elixir.ex b/lib/mix/lib/mix/compilers/elixir.ex
+index bcf0f1263..2f708bb53 100644
+--- a/lib/mix/lib/mix/compilers/elixir.ex
++++ b/lib/mix/lib/mix/compilers/elixir.ex
+@@ -5,12 +5,12 @@
+ defmodule Mix.Compilers.Elixir do
+   @moduledoc false
+ 
+-  @manifest_vsn 40
++  @manifest_vsn 41
+   @checkpoint_vsn 5
+ 
+   import Record
+ 
+-  defrecord :module, [:kind, :sources, :export, :recompile?, :timestamp, :checker]
++  defrecord :module, [:kind, :sources, :export, :recompile?, :timestamp, :checker, :types]
+ 
+   defrecord :source,
+     size: 0,
+@@ -1166,6 +1166,7 @@ defp compiler_loop(manifest, stale, stale_modules, dest, timestamp, reinfer?, op
+           long_verification_threshold: verification_threshold,
+           beam_timestamp: timestamp,
+           return_diagnostics: true,
++          return_type_checks: true,
+           verification: verification
+         ]
+ 
+@@ -1221,7 +1222,7 @@ defp compiler_loop(ref, pid, state, cwd) do
+         compiler_loop(ref, pid, state, cwd)
+ 
+       {^ref, {:ok, _modules, info}} ->
+-        {:ok, info, state}
++        {:ok, info, put_type_checks(state, Map.get(info, :type_checks, %{}))}
+ 
+       {^ref, {:error, errors, info}} ->
+         {:error, errors, info, state}
+@@ -1310,9 +1311,10 @@ defp each_cycle(stale_modules, dest, timestamp, reinfer?, state) do
+ 
+         # Type checking a dependent only reads its own code and the checker chunks
+         # (exports and signatures) of the modules it calls. When a module was recompiled
+-        # but its checker chunk is identical, its dependents' previous type check result
+-        # is still valid, so we reuse it when it had no warnings. Behaviour checks and
+-        # @after_verify callbacks always run, as they may call into the module.
++        # but its checker chunk is identical, its dependents' previous type check result,
++        # including its warnings, is still valid, so it is reported again instead.
++        # Behaviour checks and @after_verify callbacks always run, as they may call
++        # into the module.
+         signature_changed =
+           modules
+           |> Map.reject(fn {mod, module(checker: checker)} ->
+@@ -1326,16 +1328,13 @@ defp each_cycle(stale_modules, dest, timestamp, reinfer?, state) do
+         {sources, runtime_modules} =
+           Enum.reduce(sources, {sources, []}, fn
+             {source_path, source_entry}, {acc_sources, acc_modules} ->
+-              source(
+-                export_references: export_refs,
+-                runtime_references: runtime_refs,
+-                runtime_warnings: runtime_warnings
+-              ) = source_entry
++              source(export_references: export_refs, runtime_references: runtime_refs) =
++                source_entry
+ 
+               if has_any_key?(changed_modules, export_refs) or
+                    has_any_key?(changed_modules, runtime_refs) do
+-                types? =
+-                  runtime_warnings != [] or has_any_key?(signature_changed, export_refs) or
++                signature_changed? =
++                  has_any_key?(signature_changed, export_refs) or
+                     has_any_key?(signature_changed, runtime_refs)
+ 
+                 acc_sources =
+@@ -1348,7 +1347,7 @@ defp each_cycle(stale_modules, dest, timestamp, reinfer?, state) do
+                 new_modules =
+                   for module <- source(source_entry, :modules),
+                       not Map.has_key?(changed_modules, module),
+-                      do: {module, types?}
++                      do: {module, check_types(module, signature_changed?, pending_modules)}
+ 
+                 {acc_sources, new_modules ++ acc_modules}
+               else
+@@ -1357,8 +1356,8 @@ defp each_cycle(stale_modules, dest, timestamp, reinfer?, state) do
+           end)
+ 
+         runtime_paths =
+-          Enum.map(runtime_modules, fn {module, types?} ->
+-            {module, Path.join(dest, Atom.to_string(module) <> ".beam"), types?}
++          Enum.map(runtime_modules, fn {module, check_types} ->
++            {module, Path.join(dest, Atom.to_string(module) <> ".beam"), check_types}
+           end)
+ 
+         state = %{state | sources: sources}
+@@ -1366,6 +1365,34 @@ defp each_cycle(stale_modules, dest, timestamp, reinfer?, state) do
+     end
+   end
+ 
++  defp check_types(module, signature_changed?, pending_modules) do
++    case pending_modules do
++      %{^module => module(types: types)} when types != nil and not signature_changed? ->
++        {:cached, types}
++
++      %{} ->
++        true
++    end
++  end
++
++  defp put_type_checks(state, type_checks) do
++    Enum.reduce(type_checks, state, fn {module, types}, state ->
++      state
++      |> update_type_checks(:modules, module, types)
++      |> update_type_checks(:pending_modules, module, types)
++    end)
++  end
++
++  defp update_type_checks(state, key, module, types) do
++    case state do
++      %{^key => %{^module => entry} = modules} ->
++        %{state | key => %{modules | module => module(entry, types: types)}}
++
++      %{} ->
++        state
++    end
++  end
++
+   # Runtime dependents only see a module through the type checker chunk
+   # (exports, their signatures and deprecations). When it is unchanged after a
+   # recompilation, the dependents do not need to be type checked again.
+diff --git a/lib/mix/test/mix/tasks/compile.elixir_test.exs b/lib/mix/test/mix/tasks/compile.elixir_test.exs
+index a8e1b1a51..5dad7d095 100644
+--- a/lib/mix/test/mix/tasks/compile.elixir_test.exs
++++ b/lib/mix/test/mix/tasks/compile.elixir_test.exs
+@@ -2035,7 +2035,7 @@ def path, do: :b
+       output = capture_io(:stderr, fn -> Mix.Tasks.Compile.Elixir.run(["--verbose"]) end)
+       assert output =~ "incompatible types"
+ 
+-      # Same signatures, but B had warnings, so it is type checked again
++      # Same signatures, so the warnings of B are reported again
+       File.write!("lib/a.ex", """
+       defmodule A do
+         @doc "The path"
+@@ -2055,6 +2055,108 @@ def path, do: :b
+     end)
+   end
+ 
++  test "report the type warnings of runtime dependents when signatures are unchanged" do
++    in_fixture("no_mixfile", fn ->
++      Mix.Project.push(MixTest.Case.Sample)
++
++      File.write!("lib/a.ex", """
++      defmodule A do
++        def path, do: :a
++      end
++      """)
++
++      File.write!("lib/b.ex", """
++      defmodule B do
++        def run, do: A.path() <> "!"
++      end
++      """)
++
++      compile = fn args ->
++        capture_io(:stderr, fn ->
++          Mix.Tasks.Compile.Elixir.run(["--profile", "time" | args])
++        end)
++      end
++
++      # Only the warnings of B, without profile information
++      warnings = fn output ->
++        output |> String.split("\n") |> Enum.reject(&(&1 =~ "[profile]")) |> Enum.join("\n")
++      end
++
++      output = compile.([])
++      assert output =~ "incompatible types"
++      assert output =~ "Type checked B"
++      checked = warnings.(output)
++
++      # Same signatures, so B is not type checked, but its warnings are the same
++      File.write!("lib/a.ex", """
++      defmodule A do
++        @doc "The path"
++        def path, do: :a
++      end
++      """)
++
++      ensure_touched("lib/a.ex", "_build/dev/lib/sample/.mix/compile.elixir")
++      output = compile.(["--no-all-warnings"])
++      refute output =~ "Type checked B"
++      assert warnings.(output) == checked
++
++      # Again from the manifest
++      File.write!("lib/a.ex", """
++      defmodule A do
++        def path, do: :a
++      end
++      """)
++
++      ensure_touched("lib/a.ex", "_build/dev/lib/sample/.mix/compile.elixir")
++      output = compile.(["--no-all-warnings"])
++      refute output =~ "Type checked B"
++      assert warnings.(output) == checked
++
++      # Warnings as errors still fail
++      File.write!("lib/a.ex", """
++      defmodule A do
++        @doc "The path"
++        def path, do: :a
++      end
++      """)
++
++      ensure_touched("lib/a.ex", "_build/dev/lib/sample/.mix/compile.elixir")
++
++      assert capture_io(:stderr, fn ->
++               assert {:error, _} =
++                        Mix.Tasks.Compile.Elixir.run([
++                          "--warnings-as-errors",
++                          "--no-all-warnings"
++                        ])
++             end) =~ "incompatible types"
++
++      # Signature changed, so B is type checked again
++      File.write!("lib/a.ex", """
++      defmodule A do
++        def path, do: "/a"
++      end
++      """)
++
++      ensure_touched("lib/a.ex", "_build/dev/lib/sample/.mix/compile.elixir")
++      output = compile.(["--no-all-warnings"])
++      assert output =~ "Type checked B"
++      refute output =~ "incompatible types"
++
++      # And the empty result is reused
++      File.write!("lib/a.ex", """
++      defmodule A do
++        @doc "The path"
++        def path, do: "/a"
++      end
++      """)
++
++      ensure_touched("lib/a.ex", "_build/dev/lib/sample/.mix/compile.elixir")
++      output = compile.([])
++      refute output =~ "Type checked B"
++      refute output =~ "incompatible types"
++    end)
++  end
++
+   defmodule GitApp do
+     def project do
+       [
+-- 
+2.54.0 (Apple Git-157)
+

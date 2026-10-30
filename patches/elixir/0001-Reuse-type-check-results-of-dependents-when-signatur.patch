@@ -1,0 +1,377 @@
+From 239500595b7fbf3b72e39f597c36b56766f3be0c Mon Sep 17 00:00:00 2001
+From: Onni Hakala <onni@flaky.build>
+Date: Fri, 30 Oct 2026 20:37:25 +0200
+Subject: [PATCH 1/4] Reuse type check results of dependents when signatures
+ are unchanged
+
+When a module is recompiled but its ExCk chunk (exports, signatures,
+deprecations) is identical, runtime dependents without previous warnings
+reuse their type check result. Behaviour checks and @after_verify
+callbacks still run, as they may call into the recompiled module.
+
+Phoenix app with 160 routes: editing a LiveView no longer type checks the
+router again, hot reload 130ms -> 84ms.
+
+Claude-Session: https://claude.ai/code/session_01LvES9Ck5Yzq161ZVv9orsy
+---
+ lib/elixir/lib/kernel/parallel_compiler.ex    |  6 +-
+ lib/elixir/lib/module/parallel_checker.ex     | 46 ++++++++----
+ lib/mix/lib/mix/compilers/elixir.ex           | 60 +++++++++++++---
+ .../test/mix/tasks/compile.elixir_test.exs    | 70 +++++++++++++++++++
+ 4 files changed, 159 insertions(+), 23 deletions(-)
+
+diff --git a/lib/elixir/lib/kernel/parallel_compiler.ex b/lib/elixir/lib/kernel/parallel_compiler.ex
+index 221e01e65..3de7ba24a 100644
+--- a/lib/elixir/lib/kernel/parallel_compiler.ex
++++ b/lib/elixir/lib/kernel/parallel_compiler.ex
+@@ -26,7 +26,8 @@ defmodule Kernel.ParallelCompiler do
+           each_long_verification: (module() -> term()) | (module(), pid() -> term()),
+           each_module: (Path.t(), module(), binary() -> term()),
+           each_cycle: (-> {:compile, [Path.t()], [Code.diagnostic(:warning)]}
+-                          | {:runtime, [{module(), Path.t()}], [Code.diagnostic(:warning)]}),
++                          | {:runtime, [{module(), Path.t()} | {module(), Path.t(), boolean()}],
++                             [Code.diagnostic(:warning)]}),
+           long_compilation_threshold: pos_integer(),
+           long_verification_threshold: pos_integer(),
+           verification: boolean(),
+@@ -184,7 +185,8 @@ def pmap(collection, fun) when is_function(fun, 1) do
+       * `{:compile, modules, warnings}` - to continue compilation with a list of
+         further module files to compile
+       * `{:runtime, modules, warnings}` - to stop compilation and verify the list
+-        of `{module, path}` pairs because dependent modules have changed
++        of `{module, path}` pairs because dependent modules have changed. A
++        `{module, path, false}` triplet skips type checking that module
+ 
+     * `:long_compilation_threshold` - the timeout (in seconds) to check for files
+       taking too long to compile. For each file that exceeds the threshold, the
+diff --git a/lib/elixir/lib/module/parallel_checker.ex b/lib/elixir/lib/module/parallel_checker.ex
+index 7627428d3..c34c11efb 100644
+--- a/lib/elixir/lib/module/parallel_checker.ex
++++ b/lib/elixir/lib/module/parallel_checker.ex
+@@ -69,17 +69,25 @@ def spawn({pid, {checker, table}}, module, module_map, signatures, beam_location
+     # Protocols may have been consolidated. So if we know their beam location,
+     # we discard their module map on purpose and start from file.
+     if beam_location != [] and Keyword.has_key?(module_map.attributes, :__protocol__) do
+-      spawn_and_register_cache(pid, checker, table, module, List.to_string(beam_location), log?)
++      spawn_and_register_cache(
++        pid,
++        checker,
++        table,
++        module,
++        List.to_string(beam_location),
++        log?,
++        true
++      )
+     else
+       {mode, module_tuple} = cache_from_module_map(table, module_map, signatures)
+       ref = make_ref()
+-      spawned = spawn_checker(ref, pid, checker, table, module, module_tuple, log?)
++      spawned = spawn_checker(ref, pid, checker, table, module, module_tuple, log?, true)
+       register_cache_and_checker(checker, mode, module, spawned, ref)
+       :ok
+     end
+   end
+ 
+-  defp spawn_checker(ref, pid, checker, table, module, module_tuple, log?) do
++  defp spawn_checker(ref, pid, checker, table, module, module_tuple, log?, types?) do
+     spawn(fn ->
+       mon_ref = Process.monitor(pid)
+ 
+@@ -88,7 +96,7 @@ defp spawn_checker(ref, pid, checker, table, module, module_tuple, log?) do
+           # Set the compiler info so we can collect warnings
+           Process.link(pid)
+           :erlang.put(:elixir_compiler_info, {pid, self()})
+-          {warnings, errors} = check_module(module_tuple, {checker, table}, log?, profile)
++          {warnings, errors} = check_module(module_tuple, {checker, table}, log?, types?, profile)
+           send(pid, {__MODULE__, module, warnings, errors})
+           send(checker, {__MODULE__, :checked, ref})
+ 
+@@ -98,7 +106,7 @@ defp spawn_checker(ref, pid, checker, table, module, module_tuple, log?) do
+     end)
+   end
+ 
+-  defp spawn_and_register_cache(pid, checker, table, module, info, log?) do
++  defp spawn_and_register_cache(pid, checker, table, module, info, log?, types?) do
+     ref = make_ref()
+ 
+     spawned =
+@@ -122,7 +130,10 @@ defp spawn_and_register_cache(pid, checker, table, module, info, log?) do
+                  {@elixir_checker_version, contents} <- :erlang.binary_to_term(exck) do
+               mode = cache_chunk(table, module, contents)
+               module_tuple = module_map_to_module_tuple(module_map)
+-              spawned = spawn_checker(ref, pid, checker, table, module, module_tuple, log?)
++
++              spawned =
++                spawn_checker(ref, pid, checker, table, module, module_tuple, log?, types?)
++
+               :ets.insert(table, {module, mode})
+               send(checker, {__MODULE__, :cached, module, spawned, ref})
+             else
+@@ -191,8 +202,14 @@ def verify({checker, table}, runtime_files) do
+     value = :erlang.get(:elixir_code_diagnostics)
+     log? = not match?({_, false}, value)
+ 
+-    for {module, file} <- runtime_files do
+-      spawn_and_register_cache(self(), checker, table, module, file, log?)
++    for runtime_file <- runtime_files do
++      {module, file, types?} =
++        case runtime_file do
++          {module, file} -> {module, file, true}
++          {module, file, types?} -> {module, file, types?}
++        end
++
++      spawn_and_register_cache(self(), checker, table, module, file, log?, types?)
+     end
+ 
+     count = :gen_server.call(checker, :start, :infinity)
+@@ -263,7 +280,7 @@ def fetch_export({checker, table}, module, fun, arity, force?) do
+ 
+   ## Module checking
+ 
+-  defp check_module(module_tuple, cache, log?, profile) do
++  defp check_module(module_tuple, cache, log?, types?, profile) do
+     {module, file, line, definitions, no_warn_undefined, behaviours, impls, attrs, after_verify} =
+       module_tuple
+ 
+@@ -277,10 +294,15 @@ defp check_module(module_tuple, cache, log?, profile) do
+         definitions
+       )
+ 
++    # Callers reuse the previous type check result when its inputs are unchanged
+     type_warnings =
+-      profile(module, profile, fn ->
+-        Module.Types.warnings(module, file, attrs, definitions, no_warn_undefined, cache)
+-      end)
++      if types? do
++        profile(module, profile, fn ->
++          Module.Types.warnings(module, file, attrs, definitions, no_warn_undefined, cache)
++        end)
++      else
++        []
++      end
+ 
+     {warnings, errors} =
+       type_warnings
+diff --git a/lib/mix/lib/mix/compilers/elixir.ex b/lib/mix/lib/mix/compilers/elixir.ex
+index a57cc4d91..bcf0f1263 100644
+--- a/lib/mix/lib/mix/compilers/elixir.ex
++++ b/lib/mix/lib/mix/compilers/elixir.ex
+@@ -5,12 +5,12 @@
+ defmodule Mix.Compilers.Elixir do
+   @moduledoc false
+ 
+-  @manifest_vsn 39
++  @manifest_vsn 40
+   @checkpoint_vsn 5
+ 
+   import Record
+ 
+-  defrecord :module, [:kind, :sources, :export, :recompile?, :timestamp]
++  defrecord :module, [:kind, :sources, :export, :recompile?, :timestamp, :checker]
+ 
+   defrecord :source,
+     size: 0,
+@@ -218,6 +218,7 @@ def compile(manifest, srcs, dest, new_cache_key, new_parent_manifests, new_paren
+ 
+         state = %{
+           modules: %{},
++          old_checkers: Map.new(all_modules, fn {mod, module(checker: c)} -> {mod, c} end),
+           exports: exports,
+           sources: sources,
+           changed: [],
+@@ -1140,8 +1141,14 @@ defp compiler_loop(manifest, stale, stale_modules, dest, timestamp, reinfer?, op
+           each_file: fn file, lexical ->
+             compiler_call(parent, ref, {:each_file, file, lexical, verbose})
+           end,
+-          each_module: fn file, module, _binary ->
+-            compiler_call(parent, ref, {:each_module, file, module, System.os_time(:second)})
++          each_module: fn file, module, binary ->
++            checker = checker_md5(binary)
++
++            compiler_call(
++              parent,
++              ref,
++              {:each_module, file, module, System.os_time(:second), checker}
++            )
+           end,
+           each_long_compilation: fn file, pid ->
+             Mix.shell().info(
+@@ -1198,7 +1205,7 @@ defp compiler_loop(ref, pid, state, cwd) do
+         state = each_file(file, references, verbose, state, cwd)
+         compiler_loop(ref, pid, state, cwd)
+ 
+-      {^ref, {:each_module, file, module, timestamp}} ->
++      {^ref, {:each_module, file, module, timestamp, checker}} ->
+         # Read the relevant module information and unblock the compiler
+         kind = detect_kind(module)
+         external = Module.get_attribute(module, :external_resource)
+@@ -1209,6 +1216,8 @@ defp compiler_loop(ref, pid, state, cwd) do
+         state =
+           each_module(file, module, kind, external, new_export, recompile?, state, timestamp, cwd)
+ 
++        state = put_in(state.modules[module], module(state.modules[module], checker: checker))
++
+         compiler_loop(ref, pid, state, cwd)
+ 
+       {^ref, {:ok, _modules, info}} ->
+@@ -1299,17 +1308,36 @@ defp each_cycle(stale_modules, dest, timestamp, reinfer?, state) do
+         # fine because we only care about the keys.
+         changed_modules = Map.merge(modules, stale_modules)
+ 
++        # Type checking a dependent only reads its own code and the checker chunks
++        # (exports and signatures) of the modules it calls. When a module was recompiled
++        # but its checker chunk is identical, its dependents' previous type check result
++        # is still valid, so we reuse it when it had no warnings. Behaviour checks and
++        # @after_verify callbacks always run, as they may call into the module.
++        signature_changed =
++          modules
++          |> Map.reject(fn {mod, module(checker: checker)} ->
++            checker != nil and Map.get(state.old_checkers, mod) == checker
++          end)
++          |> Map.merge(stale_modules)
++
+         # Now we do a simple pass finding anything that directly depends on the modules that
+         # changed. We don't need to compute a fixpoint, because now only the directly affected
+         # matter.
+         {sources, runtime_modules} =
+           Enum.reduce(sources, {sources, []}, fn
+             {source_path, source_entry}, {acc_sources, acc_modules} ->
+-              source(export_references: export_refs, runtime_references: runtime_refs) =
+-                source_entry
++              source(
++                export_references: export_refs,
++                runtime_references: runtime_refs,
++                runtime_warnings: runtime_warnings
++              ) = source_entry
+ 
+               if has_any_key?(changed_modules, export_refs) or
+                    has_any_key?(changed_modules, runtime_refs) do
++                types? =
++                  runtime_warnings != [] or has_any_key?(signature_changed, export_refs) or
++                    has_any_key?(signature_changed, runtime_refs)
++
+                 acc_sources =
+                   Map.replace!(
+                     acc_sources,
+@@ -1318,7 +1346,9 @@ defp each_cycle(stale_modules, dest, timestamp, reinfer?, state) do
+                   )
+ 
+                 new_modules =
+-                  Enum.reject(source(source_entry, :modules), &Map.has_key?(changed_modules, &1))
++                  for module <- source(source_entry, :modules),
++                      not Map.has_key?(changed_modules, module),
++                      do: {module, types?}
+ 
+                 {acc_sources, new_modules ++ acc_modules}
+               else
+@@ -1327,13 +1357,25 @@ defp each_cycle(stale_modules, dest, timestamp, reinfer?, state) do
+           end)
+ 
+         runtime_paths =
+-          Enum.map(runtime_modules, &{&1, Path.join(dest, Atom.to_string(&1) <> ".beam")})
++          Enum.map(runtime_modules, fn {module, types?} ->
++            {module, Path.join(dest, Atom.to_string(module) <> ".beam"), types?}
++          end)
+ 
+         state = %{state | sources: sources}
+         {{:runtime, runtime_paths, []}, state}
+     end
+   end
+ 
++  # Runtime dependents only see a module through the type checker chunk
++  # (exports, their signatures and deprecations). When it is unchanged after a
++  # recompilation, the dependents do not need to be type checked again.
++  defp checker_md5(binary) do
++    case :beam_lib.chunks(binary, [~c"ExCk"]) do
++      {:ok, {_module, [{_, chunk}]}} -> :erlang.md5(chunk)
++      _ -> nil
++    end
++  end
++
+   defp each_file(file, references, verbose, state, cwd) do
+     {compile_references, export_references, runtime_references, compile_env} = references
+     %{sources: sources} = state
+diff --git a/lib/mix/test/mix/tasks/compile.elixir_test.exs b/lib/mix/test/mix/tasks/compile.elixir_test.exs
+index dc1e0b128..a8e1b1a51 100644
+--- a/lib/mix/test/mix/tasks/compile.elixir_test.exs
++++ b/lib/mix/test/mix/tasks/compile.elixir_test.exs
+@@ -1985,6 +1985,76 @@ defmodule B do
+     end)
+   end
+ 
++  test "verify runtime dependents when only the body of a module changes" do
++    in_fixture("no_mixfile", fn ->
++      Mix.Project.push(MixTest.Case.Sample)
++
++      File.write!("lib/a.ex", """
++      defmodule A do
++        def path, do: "/a"
++      end
++      """)
++
++      File.write!("lib/b.ex", """
++      defmodule B do
++        @after_verify __MODULE__
++        def run, do: A.path() <> "!"
++        def __after_verify__(__MODULE__) do
++          if A.path() != "/a", do: IO.warn("BAD PATH", __ENV__)
++        end
++      end
++      """)
++
++      output = capture_io(:stderr, fn -> Mix.Tasks.Compile.Elixir.run(["--verbose"]) end)
++      refute output =~ "BAD PATH"
++      assert_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
++
++      # Same signatures, so B skips type checking but still runs @after_verify
++      File.write!("lib/a.ex", """
++      defmodule A do
++        def path, do: "/b"
++      end
++      """)
++
++      ensure_touched("lib/a.ex", "_build/dev/lib/sample/.mix/compile.elixir")
++
++      output = capture_io(:stderr, fn -> Mix.Tasks.Compile.Elixir.run(["--verbose"]) end)
++      assert output =~ "BAD PATH"
++      assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
++      refute_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
++
++      # Signature changed, so B is type checked
++      File.write!("lib/a.ex", """
++      defmodule A do
++        def path, do: :b
++      end
++      """)
++
++      ensure_touched("lib/a.ex", "_build/dev/lib/sample/.mix/compile.elixir")
++
++      output = capture_io(:stderr, fn -> Mix.Tasks.Compile.Elixir.run(["--verbose"]) end)
++      assert output =~ "incompatible types"
++
++      # Same signatures, but B had warnings, so it is type checked again
++      File.write!("lib/a.ex", """
++      defmodule A do
++        @doc "The path"
++        def path, do: :b
++      end
++      """)
++
++      ensure_touched("lib/a.ex", "_build/dev/lib/sample/.mix/compile.elixir")
++
++      output =
++        capture_io(:stderr, fn ->
++          Mix.Tasks.Compile.Elixir.run(["--verbose", "--no-all-warnings"])
++        end)
++
++      assert output =~ "incompatible types"
++      assert output =~ "BAD PATH"
++    end)
++  end
++
+   defmodule GitApp do
+     def project do
+       [
+-- 
+2.54.0 (Apple Git-157)
+

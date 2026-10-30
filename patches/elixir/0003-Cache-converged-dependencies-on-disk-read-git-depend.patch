@@ -1,0 +1,281 @@
+From 0a0206404491716ea6192a64bc926858bdab2a03 Mon Sep 17 00:00:00 2001
+From: Onni Hakala <onni@flaky.build>
+Date: Fri, 30 Oct 2026 21:46:44 +0200
+Subject: [PATCH 3/4] Cache converged dependencies on disk, read git dependency
+ revs without git
+
+Converging dependencies starts Hex (with :ssl and :inets) and evaluates the
+mix.exs of git dependencies on every Mix command. When all dependencies are
+ok, the converged list is stored in the build path, keyed on the evaluated
+project deps, lock, paths, env, target, Elixir/OTP, archives and the manifest
+files (plus literally named env vars) of git dependencies. On a hit, each
+dependency's status is computed again from disk and the cache is discarded
+unless all are still ok. Projects with path dependencies, umbrellas and other
+SCMs are not cached. MIX_DEPS_CACHE=0 disables it.
+
+Checking the lock of a git dependency spawned git twice; a detached HEAD and a
+single origin URL in .git/config are now read directly, anything else still
+goes through git.
+
+Phoenix app with 47 deps: deps.loadpaths 129ms -> 29ms, no-op mix compile
+0.34s -> 0.23-0.25s, single-file mix test 0.60s -> 0.51s.
+---
+ lib/mix/lib/mix/dep.ex        | 135 +++++++++++++++++++++++++++++++++-
+ lib/mix/lib/mix/dep/loader.ex |  12 +++
+ lib/mix/lib/mix/scm/git.ex    |  50 +++++++++++++
+ 3 files changed, 194 insertions(+), 3 deletions(-)
+
+diff --git a/lib/mix/lib/mix/dep.ex b/lib/mix/lib/mix/dep.ex
+index 276e59501..d5438ace5 100644
+--- a/lib/mix/lib/mix/dep.ex
++++ b/lib/mix/lib/mix/dep.ex
+@@ -151,8 +151,8 @@ def load_and_cache() do
+     end
+   end
+ 
+-  defp load_and_cache(_config, top, top, env, target) do
+-    converge_and_load(env: env, target: target)
++  defp load_and_cache(config, top, top, env, target) do
++    disk_cached_converge_and_load(config, env: env, target: target)
+   end
+ 
+   defp load_and_cache(config, _top, bottom, _env, _target) do
+@@ -195,7 +195,11 @@ defp collect_children(dep, {seen, children} = acc, app) do
+   end
+ 
+   defp converge_and_load(opts) do
+-    for %{app: app, opts: opts} = dep <- Mix.Dep.Converger.converge(opts) do
++    opts |> Mix.Dep.Converger.converge() |> load_app_properties()
++  end
++
++  defp load_app_properties(deps) do
++    for %{app: app, opts: opts} = dep <- deps do
+       case Keyword.pop(opts, :app_properties) do
+         {nil, _opts} ->
+           dep
+@@ -208,6 +212,130 @@ defp converge_and_load(opts) do
+     end
+   end
+ 
++  ## Disk cache of converged dependencies
++
++  # Converging dependencies starts Hex (and with it :ssl and :inets) and
++  # evaluates the mix.exs of every git dependency, on every Mix command.
++  # When all dependencies were ok, we store the converged dependencies in
++  # the build path. The cache key covers everything convergence reads that
++  # is not checked again on a hit:
++  #
++  #   * the evaluated dependencies of the project (not mix.exs itself, so
++  #     dependencies that depend on environment variables are covered)
++  #   * the lock, the deps and build paths, env, target, Elixir/OTP and archives
++  #   * the manifest files (mix.exs, rebar.config, ...) of git dependencies,
++  #     whose children come from evaluating them, and the environment
++  #     variables these files read by literal name
++  #
++  # Hex dependencies get their children and managers from the lock. Path
++  # dependencies and other SCMs are evaluated every time, so projects with
++  # them are not cached. On a hit, the status of every dependency (checked
++  # out, compiled .app version and compile env) is computed again and the
++  # cache is discarded unless all of them are still ok.
++  @deps_cache_vsn 1
++  @manager_files ~w(mix.exs rebar.config rebar.config.script rebar.lock Makefile Makefile.win)
++  @cacheable_scms [Hex.SCM, Mix.SCM.Git]
++
++  defp disk_cached_converge_and_load(config, opts) do
++    path = deps_cache_path(config)
++
++    with true <- deps_cache_enabled?(config),
++         {:ok, binary} <- File.read(path),
++         {@deps_cache_vsn, key, deps} <- safe_binary_to_term(binary),
++         ^key <- deps_cache_key(config, opts, deps),
++         {:ok, deps} <- refresh_status(deps) do
++      load_app_properties(deps)
++    else
++      _ ->
++        deps = Mix.Dep.Converger.converge(opts)
++
++        if deps_cache_enabled?(config) and cacheable?(deps) do
++          key = deps_cache_key(config, opts, deps)
++          write_deps_cache(path, {@deps_cache_vsn, key, deps})
++        end
++
++        load_app_properties(deps)
++    end
++  end
++
++  defp deps_cache_enabled?(config) do
++    System.get_env("MIX_DEPS_CACHE") not in ~w(0 false) and is_nil(config[:apps_path])
++  end
++
++  defp deps_cache_path(config) do
++    Path.join([Mix.Project.build_path(config), ".mix", "deps_cache"])
++  end
++
++  defp safe_binary_to_term(binary) do
++    :erlang.binary_to_term(binary)
++  rescue
++    _ -> :error
++  end
++
++  defp cacheable?(deps) do
++    Enum.all?(deps, &(ok?(&1) and &1.scm in @cacheable_scms))
++  end
++
++  defp refresh_status(deps) do
++    deps = Enum.map(deps, &Mix.Dep.Loader.refresh_status/1)
++    if Enum.all?(deps, &ok?/1), do: {:ok, deps}, else: :error
++  end
++
++  defp deps_cache_key(config, opts, deps) do
++    git_files =
++      for %{scm: Mix.SCM.Git, app: app, opts: dep_opts} <- deps,
++          file <- @manager_files,
++          contents = read_or_nil(Path.join(dep_opts[:dest], file)),
++          do: {app, file, :erlang.md5(contents), env_vars_read(contents)}
++
++    archives =
++      case File.ls(Mix.path_for(:archives)) do
++        {:ok, archives} -> Enum.sort(archives)
++        {:error, _} -> []
++      end
++
++    term = {
++      opts,
++      Mix.Project.project_file(),
++      Keyword.take(config, [:app, :deps, :deps_path, :build_path, :lockfile]),
++      Mix.Project.deps_path(config),
++      Mix.Project.build_path(config),
++      read_or_nil(config[:lockfile]),
++      System.version(),
++      :erlang.system_info(:otp_release),
++      archives,
++      git_files
++    }
++
++    :erlang.md5(:erlang.term_to_binary(term))
++  end
++
++  defp read_or_nil(path) do
++    case File.read(path) do
++      {:ok, contents} -> contents
++      {:error, _} -> nil
++    end
++  end
++
++  defp env_vars_read(contents) do
++    for [_, name] <- Regex.scan(~r/(?:get_env|fetch_env!?|getenv)\(\s*["']([^"']+)["']/, contents),
++        do: {name, System.get_env(name)}
++  end
++
++  defp write_deps_cache(path, term) do
++    tmp = path <> ".#{System.unique_integer([:positive])}"
++
++    with :ok <- File.mkdir_p(Path.dirname(path)),
++         :ok <- File.write(tmp, :erlang.term_to_binary(term)) do
++      File.rename(tmp, path)
++    end
++  end
++
++  defp clear_disk_cache() do
++    config = Mix.Project.config()
++    File.rm(deps_cache_path(config))
++  end
++
+   defp read_cached_deps(project, env_target) do
+     case Mix.State.read_cache({:cached_deps, project}) do
+       {^env_target, deps} -> deps
+@@ -227,6 +355,7 @@ def clear_cached() do
+     if project = Mix.Project.get() do
+       key = {:cached_deps, project}
+       Mix.State.delete_cache(key)
++      clear_disk_cache()
+     end
+   end
+ 
+diff --git a/lib/mix/lib/mix/dep/loader.ex b/lib/mix/lib/mix/dep/loader.ex
+index af4be417c..8c805e17a 100644
+--- a/lib/mix/lib/mix/dep/loader.ex
++++ b/lib/mix/lib/mix/dep/loader.ex
+@@ -114,6 +114,18 @@ def load(%Mix.Dep{manager: manager, scm: scm, opts: opts} = dep, children, locke
+     |> validate_app()
+   end
+ 
++  @doc """
++  Computes the status of an already converged dependency again,
++  from the files on disk, without loading its children again.
++  """
++  def refresh_status(%Mix.Dep{scm: scm, opts: opts} = dep) do
++    opts = Keyword.delete(opts, :app_properties)
++
++    %{dep | status: scm_status(scm, opts), opts: opts}
++    |> validate_app()
++    |> validate_manifest()
++  end
++
+   @doc """
+   Checks if a requirement from a dependency matches
+   the given version.
+diff --git a/lib/mix/lib/mix/scm/git.ex b/lib/mix/lib/mix/scm/git.ex
+index 7fcf77881..0a31ff356 100644
+--- a/lib/mix/lib/mix/scm/git.ex
++++ b/lib/mix/lib/mix/scm/git.ex
+@@ -338,6 +338,56 @@ defp redact_uri(git) do
+   end
+ 
+   defp get_rev_info(dir \\ nil) do
++    git_dir = Path.join(dir || File.cwd!(), ".git")
++    read_rev_info(git_dir) || git_rev_info(dir)
++  end
++
++  # Checking the lock of git dependencies runs on every Mix command, so we
++  # avoid spawning git twice per dependency when the checkout is in the state
++  # Mix leaves it: a detached HEAD and a single origin URL in the local config.
++  # Anything else (symbolic refs, includes, multiple URLs) goes through git.
++  defp read_rev_info(git_dir) do
++    with {:ok, head} <- File.read(Path.join(git_dir, "HEAD")),
++         rev = String.trim(head),
++         true <- Regex.match?(~r/\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z/, rev),
++         {:ok, config} <- File.read(Path.join(git_dir, "config")),
++         false <- String.contains?(config, ["[include", "\\\n"]),
++         [origin] <- origin_urls(config) do
++      %{origin: origin, rev: rev}
++    else
++      _ -> nil
++    end
++  end
++
++  defp origin_urls(config) do
++    config
++    |> String.split("\n")
++    |> Enum.reduce({nil, []}, fn line, {section, urls} ->
++      line = String.trim(line)
++
++      cond do
++        String.starts_with?(line, "[") ->
++          {line, urls}
++
++        section == ~s([remote "origin"]) and Regex.match?(~r/\Aurl\s*=/, line) ->
++          [_, url] = String.split(line, "=", parts: 2)
++          {section, [String.trim(url) | urls]}
++
++        true ->
++          {section, urls}
++      end
++    end)
++    |> case do
++      # Quotes, comments and escapes need git's own parser
++      {_, [url]} ->
++        if url == "" or String.contains?(url, ["\"", ";", "#", "\\"]), do: [], else: [url]
++
++      _ ->
++        []
++    end
++  end
++
++  defp git_rev_info(dir) do
+     # These commands can fail and we don't want to raise.
+     origin_command = ["--git-dir=.git", "config", "remote.origin.url"]
+     rev_command = ["--git-dir=.git", "rev-parse", "--verify", "--quiet", "HEAD"]
+-- 
+2.54.0 (Apple Git-157)
+

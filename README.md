@@ -162,12 +162,14 @@ g(0) -> 0;
 g(I) -> g(I div 3).              % widening g/1's argument type hits norm_number/1
 ```
 
-[`devenv.nix`](devenv.nix) builds the OTP and Elixir forks from source.
+[`devenv.nix`](devenv.nix) builds Erlang/OTP and Elixir from the upstream repositories at a pinned
+commit plus the patches in [`patches/`](patches/); each patch is documented in `devenv.nix` (what,
+why, upstream status).
 
 ## Reproduce
 
 ```sh
-devenv shell                       # Erlang/OTP + Elixir forks, built from source
+devenv shell                       # upstream Erlang/OTP + Elixir + patches/, built from source
 bench/generate-app.sh shop         # regenerate the app (or use the committed one)
 cd shop && ../bench/measure.sh . 7
 

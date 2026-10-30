@@ -1,0 +1,106 @@
+From 998ef60b941affda05e12456d0476c63750f00ff Mon Sep 17 00:00:00 2001
+From: Onni Hakala <onni@flaky.build>
+Date: Fri, 30 Oct 2026 21:39:43 +0200
+Subject: [PATCH 4/4] Skip debug info decoding for dependents that are not type
+ checked
+
+Dependents whose type check result is reused only run behaviour checks and
+@after_verify callbacks. The checker chunk now lists the callbacks, so the
+debug info is only decoded when one of the module's behaviours was compiled
+after it. Experiment: -35ms CPU per core_components edit, ~-6ms group pass.
+---
+ lib/elixir/lib/module/parallel_checker.ex | 47 +++++++++++++++++++++++
+ lib/elixir/src/elixir_erl.erl             |  3 ++
+ 2 files changed, 50 insertions(+)
+
+diff --git a/lib/elixir/lib/module/parallel_checker.ex b/lib/elixir/lib/module/parallel_checker.ex
+index 652c0c345..3efe4db1f 100644
+--- a/lib/elixir/lib/module/parallel_checker.ex
++++ b/lib/elixir/lib/module/parallel_checker.ex
+@@ -126,6 +126,7 @@ defp spawn_and_register_cache(pid, checker, table, module, info, log?, check_typ
+               end
+ 
+             with {:ok, binary} <- File.read(location),
++                 :full <- light_check(check_types, pid, checker, table, module, binary, log?, ref),
+                  {:ok, {_, [{:debug_info, {:debug_info_v1, backend, data}}, {~c"ExCk", exck}]}} <-
+                    :beam_lib.chunks(binary, [:debug_info, ~c"ExCk"]),
+                  {:ok, module_map} <- backend.debug_info(:elixir_v1, module, data, []),
+@@ -139,6 +140,9 @@ defp spawn_and_register_cache(pid, checker, table, module, info, log?, check_typ
+               :ets.insert(table, {module, mode})
+               send(checker, {__MODULE__, :cached, module, spawned, ref})
+             else
++              :light ->
++                :ok
++
+               _ ->
+                 # Nothing to check, so we notify everyone we are done
+                 :ets.insert(table, {module, :uncached})
+@@ -155,6 +159,49 @@ defp spawn_and_register_cache(pid, checker, table, module, info, log?, check_typ
+     :ok
+   end
+ 
++  # When a module is not type checked, only behaviour checks and @after_verify
++  # callbacks run. The checker chunk lists the callbacks, so we skip decoding
++  # the debug info unless a behaviour changed after the module was compiled.
++  defp light_check(true, _pid, _checker, _table, _module, _binary, _log?, _ref), do: :full
++
++  # Not type checked (false) or replaying a cached result ({:cached, types})
++  defp light_check(check_types, pid, checker, table, module, binary, log?, ref) do
++    with {:ok, {_, [{~c"ExCk", exck}, {:attributes, attributes}]}} <-
++           :beam_lib.chunks(binary, [~c"ExCk", :attributes]),
++         {@elixir_checker_version, %{after_verify: after_verify} = contents} <-
++           :erlang.binary_to_term(exck),
++         false <- behaviour_newer?(module, attributes) do
++      mode = cache_chunk(table, module, contents)
++      module_tuple = {module, "nofile", 0, [], [], [], [], [], after_verify}
++      spawned = spawn_checker(ref, pid, checker, table, module, module_tuple, log?, check_types)
++      :ets.insert(table, {module, mode})
++      send(checker, {__MODULE__, :cached, module, spawned, ref})
++      :light
++    else
++      _ -> :full
++    end
++  end
++
++  defp behaviour_newer?(module, attributes) do
++    behaviours = for {:behaviour, mods} <- attributes, mod <- mods, do: mod
++
++    behaviours != [] and
++      with [_ | _] = path <- :code.which(module),
++           {:ok, %{mtime: mtime}} <- File.stat(path, time: :posix) do
++        Enum.any?(behaviours, fn behaviour ->
++          case :code.which(behaviour) do
++            [_ | _] = bpath ->
++              match?({:ok, %{mtime: bmtime}} when bmtime >= mtime, File.stat(bpath, time: :posix))
++
++            _ ->
++              true
++          end
++        end)
++      else
++        _ -> true
++      end
++  end
++
+   @doc """
+   Verifies the given compilation function
+   by starting a checker if one does not exist.
+diff --git a/lib/elixir/src/elixir_erl.erl b/lib/elixir/src/elixir_erl.erl
+index ca29a307e..cc0344b51 100644
+--- a/lib/elixir/src/elixir_erl.erl
++++ b/lib/elixir/src/elixir_erl.erl
+@@ -663,8 +663,11 @@ checker_chunk(Map, Def, Signatures, ChunkOpts) ->
+       {FA, Info}
+     end || {FA, _Meta} <- prepend_behaviour_info(DefinesBehaviour, Def)],
+ 
++  #{after_verify := AfterVerify} = Map,
++
+   Contents = #{
+     exports => Exports,
++    after_verify => AfterVerify,
+     mode => case lists:keymember('__protocol__', 1, Attributes) of
+       true -> protocol;
+       false -> elixir
+-- 
+2.54.0 (Apple Git-157)
+
