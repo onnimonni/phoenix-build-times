@@ -7,6 +7,7 @@ defmodule Shop.MixProject do
       version: "0.1.0",
       elixir: "~> 1.17",
       elixirc_paths: elixirc_paths(Mix.env()),
+      elixirc_options: elixirc_options(Mix.env()),
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
       deps: deps(),
@@ -31,6 +32,34 @@ defmodule Shop.MixProject do
     ]
   end
 
+  # The Erlang compiler's optimization passes make code faster at runtime but
+  # cost ~70% of compile time. Development and test builds skip them and
+  # interpret module bodies (Elixir 1.20+), which compiles ~30% faster.
+  # Production keeps every optimization.
+  @fast_compile [
+    module_definition: :interpreted,
+    erlc_options: [
+      :no_ssa_opt,
+      :no_copt,
+      :no_bsm_opt,
+      :no_bool_opt,
+      :no_share_opt,
+      :no_recv_opt,
+      :no_throw_opt
+    ]
+  ]
+
+  defp elixirc_options(:prod) do
+    # devenv sets ERL_COMPILER_OPTIONS for fast dev builds of dependencies
+    if (System.get_env("ERL_COMPILER_OPTIONS") || "") =~ "no_ssa_opt" do
+      Mix.raise("Unset ERL_COMPILER_OPTIONS for production builds, it disables optimizations")
+    end
+
+    []
+  end
+
+  defp elixirc_options(_env), do: @fast_compile
+
   # Specifies which paths to compile per environment.
   defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_), do: ["lib"]
@@ -41,13 +70,14 @@ defmodule Shop.MixProject do
   defp deps do
     [
       {:bcrypt_elixir, "~> 3.0"},
-      {:phoenix, "~> 1.8.16"},
+      {:phoenix, github: "phoenixframework/phoenix", branch: "main", override: true},
       {:phoenix_ecto, "~> 4.5"},
       {:ecto_sql, "~> 3.13"},
       {:ecto_sqlite3, ">= 0.0.0"},
       {:phoenix_html, "~> 4.1"},
       {:phoenix_live_reload, "~> 1.2", only: :dev},
-      {:phoenix_live_view, "~> 1.2.0"},
+      {:phoenix_live_view,
+       github: "phoenixframework/phoenix_live_view", branch: "main", override: true},
       {:lazy_html, ">= 0.1.0", only: :test},
       {:phoenix_live_dashboard, "~> 0.8.3"},
       {:esbuild, "~> 0.10", runtime: Mix.env() == :dev},

@@ -39,7 +39,7 @@ run "edit core_components" "printf '\\n# bench %s\\n' \$(date +%s%N) >> $web/com
 run "edit schema" "printf '\\n# bench %s\\n' \$(date +%s%N) >> lib/$app/catalog/catalog_alpha.ex" "mix compile" count
 run "edit context" "printf '\\n# bench %s\\n' \$(date +%s%N) >> lib/$app/catalog.ex" "mix compile" count
 run "edit liveview" "printf '\\n# bench %s\\n' \$(date +%s%N) >> $web/live/catalog_alpha_live/index.ex" "mix compile" count
-run "test env compile (cold)" "rm -rf _build/test/lib/$app" "MIX_ENV=test mix compile"
+run "test env compile (cold)" "rm -rf _build/test/lib/$app" "env MIX_ENV=test mix compile"
 
 # undo the benchmark edits
 git checkout -q -- lib 2>/dev/null || true

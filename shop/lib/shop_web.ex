@@ -21,7 +21,9 @@ defmodule ShopWeb do
 
   def router do
     quote do
-      use Phoenix.Router, helpers: false
+      # group_by: :verb compiles __match_route__ per HTTP verb, which is much
+      # cheaper for the Erlang compiler on large routers (Phoenix main)
+      use Phoenix.Router, helpers: false, group_by: :verb
 
       # Import common connection and controller functions to use in pipelines
       import Plug.Conn
