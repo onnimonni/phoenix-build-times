@@ -113,7 +113,15 @@ internal error in pass beam_validator_strong: bad argument in float/1
 against `10^2000`, which is beyond the float range. It was introduced in 6fc2465974 ("Fix
 `argument_widened` assertion").
 [onnimonni/otp@`fix-norm-number-bigint`](https://github.com/onnimonni/otp/tree/fix-norm-number-bigint)
-keeps such integers as they are. [`devenv.nix`](devenv.nix) builds that fork, plus Elixir
+keeps such integers as they are, with a regression test in `beam_type_SUITE`. The smallest
+module that crashes the unpatched compiler, found by shrinking `Decimal`'s abstract code:
+
+```erlang
+f(I) when I < 1 bsl 1100 -> I;   % I is a number range starting beyond the float range
+f(I) -> g(I).
+g(0) -> 0;
+g(I) -> g(I div 3).              % widening g/1's argument type hits norm_number/1
+``` [`devenv.nix`](devenv.nix) builds that fork, plus Elixir
 `main`, from source.
 
 ## What's left
