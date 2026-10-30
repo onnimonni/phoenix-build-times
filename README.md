@@ -98,7 +98,7 @@ compile-time `private`/`assigns` into the conn: 180 extra functions for the Erla
 [onnimonni/phoenix@`router-shared-prepare`](https://github.com/onnimonni/phoenix/tree/router-shared-prepare)
 returns that data as a literal instead, shared by one `Phoenix.Router.Route.prepare/3`. Route
 metadata, telemetry and `route_info/4` are unchanged, and all 1,113 Phoenix tests pass. Router
-compile: 765ms → 630ms.
+compile: 765ms → 630ms. Upstream PR: [phoenixframework/phoenix#6888](https://github.com/phoenixframework/phoenix/pull/6888).
 
 ### 5. Erlang/OTP fork: a compiler crash on master
 
@@ -113,7 +113,8 @@ internal error in pass beam_validator_strong: bad argument in float/1
 against `10^2000`, which is beyond the float range. It was introduced in 6fc2465974 ("Fix
 `argument_widened` assertion").
 [onnimonni/otp@`fix-norm-number-bigint`](https://github.com/onnimonni/otp/tree/fix-norm-number-bigint)
-keeps such integers as they are, with a regression test in `beam_type_SUITE`. The smallest
+keeps such integers as they are, with a regression test in `beam_type_SUITE`. Upstream PR:
+[erlang/otp#12121](https://github.com/erlang/otp/pull/12121). The smallest
 module that crashes the unpatched compiler, found by shrinking `Decimal`'s abstract code:
 
 ```erlang
