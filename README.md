@@ -122,8 +122,9 @@ f(I) when I < 1 bsl 1100 -> I;   % I is a number range starting beyond the float
 f(I) -> g(I).
 g(0) -> 0;
 g(I) -> g(I div 3).              % widening g/1's argument type hits norm_number/1
-``` [`devenv.nix`](devenv.nix) builds that fork, plus Elixir
-`main`, from source.
+```
+
+[`devenv.nix`](devenv.nix) builds that fork, plus Elixir `main`, from source.
 
 ## What's left
 
